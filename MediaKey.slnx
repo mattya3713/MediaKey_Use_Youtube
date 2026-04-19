@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="MediaKey/MediaKey.vcxproj" Id="2e5b239e-445d-48ee-a3a3-d3a60e082177" />
+</Solution>
