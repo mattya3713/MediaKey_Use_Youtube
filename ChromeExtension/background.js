@@ -46,6 +46,21 @@ function sendCommandToYouTubeTabs(command) {
                   video.pause();
                 }
                 break;
+              case "adskip": {
+                const ad_skip_button =
+                  document.querySelector(".ytp-ad-skip-button") ||
+                  document.querySelector(".ytp-ad-skip-button-modern") ||
+                  document.querySelector("button.ytp-skip-ad-button") ||
+                  Array.from(document.querySelectorAll("button, div[role='button']")).find((element) => {
+                    const text = (element.textContent || "").trim();
+                    const aria_label = (element.getAttribute("aria-label") || "").trim();
+                    return text.includes("広告をスキップ") || aria_label.includes("広告をスキップ");
+                  });
+                if (ad_skip_button) {
+                  ad_skip_button.click();
+                }
+                break;
+              }
               default:
                 break;
             }

@@ -5,7 +5,13 @@
 #include <ixwebsocket/IXNetSystem.h>
 #include <ixwebsocket/IXWebSocketServer.h>
 #include <shellapi.h>
+#include <mmreg.h>
+#include <mmdeviceapi.h>
+#include <propidl.h>
+#include <propvarutil.h>
+#include <wrl/client.h>
 #include <algorithm>
+#include <cwctype>
 #include <iostream>
 #include <mutex>
 #include <string>
@@ -17,6 +23,33 @@
 #pragma comment(lib, "ncrypt.lib")
 #pragma comment(lib, "wintrust.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "uuid.lib")
+
+MIDL_INTERFACE("568b9108-44bf-40b4-9006-86afe5b5a620")
+IPolicyConfigVista : public IUnknown
+{
+public:
+    virtual HRESULT STDMETHODCALLTYPE GetMixFormat(PCWSTR, WAVEFORMATEX**) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetDeviceFormat(PCWSTR, INT, WAVEFORMATEX**) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetDeviceFormat(PCWSTR, WAVEFORMATEX*, WAVEFORMATEX*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetProcessingPeriod(PCWSTR, INT, PINT64, PINT64) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetProcessingPeriod(PCWSTR, PINT64) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetShareMode(PCWSTR, struct DeviceShareMode*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetShareMode(PCWSTR, struct DeviceShareMode*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetPropertyValue(PCWSTR, const PROPERTYKEY&, PROPVARIANT*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetPropertyValue(PCWSTR, const PROPERTYKEY&, PROPVARIANT*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetDefaultEndpoint(PCWSTR wszDeviceId, ERole role) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetEndpointVisibility(PCWSTR, INT) = 0;
+};
+
+class DECLSPEC_UUID("294935ce-f637-4e7c-a41b-ab255460b862") CPolicyConfigVistaClient;
+
+const PROPERTYKEY PKEY_Device_FriendlyName =
+{
+    { 0xa45c254e, 0xdf1c, 0x4efd, { 0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0 } },
+    14
+};
 
 class MediaControllerApp
 {
@@ -33,6 +66,14 @@ public:
             return 0;
         }
 
+        const HRESULT co_init_result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        const bool com_initialized = SUCCEEDED(co_init_result) || co_init_result == RPC_E_CHANGED_MODE;
+        if (!com_initialized)
+        {
+            std::cout << "[ERR] COM init failed" << std::endl;
+            return 1;
+        }
+
         const bool is_background_mode = HasBackgroundFlag();
         if (is_background_mode)
         {
@@ -41,6 +82,7 @@ public:
 
         std::cout << "[START] Media Controller" << std::endl;
         ix::initNetSystem();
+        m_main_thread_id = GetCurrentThreadId();
 
         s_instance = this;
         SetConsoleCtrlHandler(ConsoleControlHandler, TRUE);
@@ -50,6 +92,10 @@ public:
         if (!StartWebSocketServer())
         {
             ix::uninitNetSystem();
+            if (SUCCEEDED(co_init_result))
+            {
+                CoUninitialize();
+            }
             return 1;
         }
 
@@ -57,12 +103,22 @@ public:
         {
             m_server.stop();
             ix::uninitNetSystem();
+            if (SUCCEEDED(co_init_result))
+            {
+                CoUninitialize();
+            }
             return 1;
         }
 
         MSG msg = {};
         while (GetMessage(&msg, nullptr, 0, 0) > 0)
         {
+            if (msg.message == WM_APP + 1)
+            {
+                ToggleAudioOutputDevice();
+                continue;
+            }
+
             TranslateMessage(&msg);
             DispatchMessage(&msg);
         }
@@ -75,18 +131,25 @@ public:
             CloseHandle(m_instance_mutex);
             m_instance_mutex = nullptr;
         }
+        if (SUCCEEDED(co_init_result))
+        {
+            CoUninitialize();
+        }
         return 0;
     }
 private:
     static MediaControllerApp* s_instance;
     static constexpr const wchar_t* k_run_key_path = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
     static constexpr const wchar_t* k_run_value_name = L"MediaKeyController";
+    static constexpr const wchar_t* k_headphone_name_hint = L"ヘッドホン";
+    static constexpr const wchar_t* k_speaker_name_hint = L"スピーカー";
 
     ix::WebSocketServer m_server;
     std::vector<std::weak_ptr<ix::WebSocket>> m_clients;
     std::mutex m_client_mutex;
     HHOOK m_hook = nullptr;
     HANDLE m_instance_mutex = nullptr;
+    DWORD m_main_thread_id = 0;
 
     bool AcquireSingleInstance()
     {
@@ -104,6 +167,186 @@ private:
         }
 
         return true;
+    }
+
+    static std::wstring ToLower(const std::wstring& Text)
+    {
+        std::wstring lowered = Text;
+        std::transform(
+            lowered.begin(),
+            lowered.end(),
+            lowered.begin(),
+            [](wchar_t character)
+            {
+                return static_cast<wchar_t>(towlower(character));
+            });
+        return lowered;
+    }
+
+    static bool ContainsIgnoreCase(const std::wstring& Text, const std::wstring& Pattern)
+    {
+        if (Pattern.empty())
+        {
+            return false;
+        }
+
+        const std::wstring lowered_text = ToLower(Text);
+        const std::wstring lowered_pattern = ToLower(Pattern);
+        return lowered_text.find(lowered_pattern) != std::wstring::npos;
+    }
+
+    static bool GetFriendlyName(IMMDevice* Device, std::wstring& FriendlyName)
+    {
+        if (Device == nullptr)
+        {
+            return false;
+        }
+
+        Microsoft::WRL::ComPtr<IPropertyStore> property_store;
+        if (FAILED(Device->OpenPropertyStore(STGM_READ, &property_store)))
+        {
+            return false;
+        }
+
+        PROPVARIANT value;
+        PropVariantInit(&value);
+
+        bool success = false;
+        if (SUCCEEDED(property_store->GetValue(PKEY_Device_FriendlyName, &value)) && value.vt == VT_LPWSTR && value.pwszVal != nullptr)
+        {
+            FriendlyName = value.pwszVal;
+            success = true;
+        }
+
+        PropVariantClear(&value);
+        return success;
+    }
+
+    static bool GetDefaultRenderDeviceName(std::wstring& DeviceName)
+    {
+        Microsoft::WRL::ComPtr<IMMDeviceEnumerator> enumerator;
+        if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&enumerator))))
+        {
+            return false;
+        }
+
+        Microsoft::WRL::ComPtr<IMMDevice> default_device;
+        if (FAILED(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &default_device)))
+        {
+            return false;
+        }
+
+        return GetFriendlyName(default_device.Get(), DeviceName);
+    }
+
+    static bool FindRenderDeviceIdByHint(const std::wstring& NameHint, std::wstring& DeviceId)
+    {
+        Microsoft::WRL::ComPtr<IMMDeviceEnumerator> enumerator;
+        if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&enumerator))))
+        {
+            return false;
+        }
+
+        Microsoft::WRL::ComPtr<IMMDeviceCollection> collection;
+        if (FAILED(enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &collection)))
+        {
+            return false;
+        }
+
+        UINT count = 0;
+        if (FAILED(collection->GetCount(&count)))
+        {
+            return false;
+        }
+
+        for (UINT index = 0; index < count; ++index)
+        {
+            Microsoft::WRL::ComPtr<IMMDevice> device;
+            if (FAILED(collection->Item(index, &device)))
+            {
+                continue;
+            }
+
+            std::wstring friendly_name;
+            if (!GetFriendlyName(device.Get(), friendly_name))
+            {
+                continue;
+            }
+
+            if (!ContainsIgnoreCase(friendly_name, NameHint))
+            {
+                continue;
+            }
+
+            LPWSTR device_id = nullptr;
+            if (FAILED(device->GetId(&device_id)) || device_id == nullptr)
+            {
+                continue;
+            }
+
+            DeviceId = device_id;
+            CoTaskMemFree(device_id);
+            return true;
+        }
+
+        return false;
+    }
+
+    static bool SetDefaultRenderDevice(const std::wstring& DeviceId)
+    {
+        Microsoft::WRL::ComPtr<IPolicyConfigVista> policy_config;
+        if (FAILED(CoCreateInstance(__uuidof(CPolicyConfigVistaClient), nullptr, CLSCTX_ALL, __uuidof(IPolicyConfigVista), reinterpret_cast<void**>(policy_config.GetAddressOf()))))
+        {
+            return false;
+        }
+
+        if (FAILED(policy_config->SetDefaultEndpoint(DeviceId.c_str(), eConsole)))
+        {
+            return false;
+        }
+
+        if (FAILED(policy_config->SetDefaultEndpoint(DeviceId.c_str(), eMultimedia)))
+        {
+            return false;
+        }
+
+        if (FAILED(policy_config->SetDefaultEndpoint(DeviceId.c_str(), eCommunications)))
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    void ToggleAudioOutputDevice() const
+    {
+        std::wstring current_device_name;
+        if (!GetDefaultRenderDeviceName(current_device_name))
+        {
+            std::cout << "[AUDIO] current device read failed" << std::endl;
+            return;
+        }
+
+        const bool is_headphone_active =
+            ContainsIgnoreCase(current_device_name, k_headphone_name_hint) ||
+            ContainsIgnoreCase(current_device_name, L"headphone");
+
+        const std::wstring target_hint = is_headphone_active ? k_speaker_name_hint : k_headphone_name_hint;
+
+        std::wstring target_device_id;
+        if (!FindRenderDeviceIdByHint(target_hint, target_device_id))
+        {
+            std::cout << "[AUDIO] target device not found" << std::endl;
+            return;
+        }
+
+        if (!SetDefaultRenderDevice(target_device_id))
+        {
+            std::cout << "[AUDIO] switch failed" << std::endl;
+            return;
+        }
+
+        std::cout << "[AUDIO] switched" << std::endl;
     }
 
     static BOOL WINAPI ConsoleControlHandler(DWORD ControlType)
@@ -271,6 +514,11 @@ private:
             if (keyboard_data != nullptr)
             {
                 s_instance->HandleMediaKey(static_cast<int>(keyboard_data->vkCode));
+
+                if (keyboard_data->vkCode == VK_MEDIA_STOP || keyboard_data->vkCode == VK_BROWSER_STOP)
+                {
+                    return 1;
+                }
             }
         }
 
@@ -351,6 +599,11 @@ private:
 
     void HandleMediaKey(int VirtualKey)
     {
+        if (m_main_thread_id == 0)
+        {
+            m_main_thread_id = GetCurrentThreadId();
+        }
+
         std::string command;
 
         switch (VirtualKey)
@@ -364,7 +617,16 @@ private:
         case VK_MEDIA_PLAY_PAUSE:
             command = "playpause";
             break;
+        case VK_MEDIA_STOP:
+        case VK_BROWSER_STOP:
+            std::cout << "[KEY] outputtoggle" << std::endl;
+            PostThreadMessage(m_main_thread_id, WM_APP + 1, 0, 0);
+            return;
         default:
+            if (VirtualKey >= 0xA6 && VirtualKey <= 0xB7)
+            {
+                std::cout << "[KEY] unmapped vk=" << VirtualKey << std::endl;
+            }
             break;
         }
 
